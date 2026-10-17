@@ -1,0 +1,112 @@
+name: "Reusable OpenTofu Pipeline (AWS OIDC)"
+
+on:
+  workflow_call:
+    inputs:
+      working_directory:
+        description: "Directory containing the OpenTofu / Terraform root module"
+        required: false
+        type: string
+        default: "."
+      aws_region:
+        description: "AWS region for deployment"
+        required: false
+        type: string
+        default: "eu-west-1"
+      role_to_assume:
+        description: "IAM Role ARN to assume via GitHub OIDC federation (or pass via AWS_ROLE_ARN secret)"
+        required: false
+        type: string
+        default: ""
+      state_bucket:
+        description: "S3 bucket name for OpenTofu state (or pass via TF_STATE_BUCKET secret)"
+        required: false
+        type: string
+        default: ""
+      tofu_version:
+        description: "OpenTofu version to install (defaults to latest)"
+        required: false
+        type: string
+        default: "latest"
+      apply:
+        description: "Whether to apply changes automatically on push to main"
+        required: false
+        type: boolean
+        default: true
+      var_file:
+        description: "Optional path to a .tfvars file relative to working-directory"
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  tofu:
+    name: "OpenTofu Plan & Apply"
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      ACCOUNT_MASK: ${{ secrets.AWS_ACCOUNT_ID }}
+      ROLE_MASK: ${{ secrets.AWS_ROLE_ARN }}
+      BUCKET_MASK: ${{ secrets.TF_STATE_BUCKET }}
+
+    steps:
+      - name: Checkout Caller Repository
+        uses: actions/checkout@v4
+
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version: ${{ inputs.tofu_version }}
+
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || inputs.role_to_assume }}
+          aws-region: ${{ inputs.aws_region }}
+          audience: sts.amazonaws.com
+
+      - name: Verify AWS Identity
+        run: |
+          echo "Successfully authenticated to AWS via OIDC"
+          aws sts get-caller-identity --query "Arn" --output text
+
+      - name: OpenTofu Format Check
+        working-directory: ${{ inputs.working_directory }}
+        run: tofu fmt -check
+
+      - name: OpenTofu Init
+        working-directory: ${{ inputs.working_directory }}
+        env:
+          TF_BUCKET: ${{ secrets.TF_STATE_BUCKET || inputs.state_bucket }}
+        run: |
+          INIT_ARGS=""
+          if [ -n "$TF_BUCKET" ]; then
+            echo "Configuring remote state bucket dynamically..."
+            INIT_ARGS="-backend-config=bucket=$TF_BUCKET"
+          fi
+          tofu init $INIT_ARGS
+
+      - name: OpenTofu Validate
+        working-directory: ${{ inputs.working_directory }}
+        run: tofu validate -no-color
+
+      - name: OpenTofu Plan
+        id: plan
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          ARGS=""
+          if [ -n "${{ inputs.var_file }}" ] && [ -f "${{ inputs.var_file }}" ]; then
+            echo "Using specified var file: ${{ inputs.var_file }}"
+            ARGS="-var-file=${{ inputs.var_file }}"
+          elif [ -f "terraform.tfvars" ]; then
+            echo "Found terraform.tfvars in working directory"
+            ARGS="-var-file=terraform.tfvars"
+          fi
+          tofu plan -no-color -out=tfplan $ARGS
+
+      - name: OpenTofu Apply
+        if: inputs.apply && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        working-directory: ${{ inputs.working_directory }}
+        run: tofu apply -auto-approve tfplan
